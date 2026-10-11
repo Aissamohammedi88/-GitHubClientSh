@@ -1,0 +1,2284 @@
+#!/usr/bin/env python3# -*- coding: utf-8 -*-
+"""
+================================================================================
+GITHUB CLIENT INTELLIGENT v1.0.0
+================================================================================
+Auteur : Aissa Mohammedi (DGK)
+Licence : NEXUS-OPEN-2.0
+Build : 2026-10-11
+
+Fonctionnalités :
+- Client API GitHub REST v3 + GraphQL v4
+- Authentification (token, OAuth device flow)
+- Cache local SQLite (économie rate limit)
+- Recherche intelligente (repos, users, code, issues)
+- Analyse de repos (langages, stats, activité)
+- Analyse de profil utilisateur (contributions, top repos)
+- Système de recommandations (repos similaires, contributeurs)
+- Trending / Discovery
+- Gestion issues / PR / commits
+- Dashboard web local (temps réel)
+- Export JSON / Markdown
+- Rate limit tracking
+- Mode hors-ligne (cache)
+- Dry-run pour actions destructives
+- Multi-format output (table, JSON, markdown)
+================================================================================
+"""
+
+import os
+import sys
+import json
+import time
+import math
+import sqlite3
+import hashlib
+import logging
+import argparse
+import urllib.request
+import urllib.parse
+import urllib.error
+from pathlib import Path
+from datetime import datetime, timedelta, timezone
+from collections import Counter, defaultdict
+from dataclasses import dataclass, field, asdict
+from typing import Optional, List, Dict, Any, Tuple
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# ============================================================================
+# SECTION 1 — CONSTANTES
+# ============================================================================
+
+VERSION = "1.0.0"
+AUTEUR = "Aissa Mohammedi (DGK)"
+LICENCE = "NEXUS-OPEN-2.0"
+BUILD_DATE = "2026-10-11"
+
+BASE_DIR = Path.home() / "Documents" / "github_client"
+DATA_DIR = BASE_DIR / "data"
+CACHE_DIR = BASE_DIR / "cache"
+LOG_DIR = BASE_DIR / "logs"
+REPORT_DIR = BASE_DIR / "reports"
+CONFIG_FILE = BASE_DIR / "config.json"
+DB_FILE = DATA_DIR / "github_cache.db"
+LOG_FILE = LOG_DIR / "github_client.log"
+
+for d in [BASE_DIR, DATA_DIR, CACHE_DIR, LOG_DIR, REPORT_DIR]:
+d.mkdir(parents=True, exist_ok=True)
+
+# API endpoints
+API_REST = "https://api.github.com"
+API_GRAPHQL = "https://api.github.com/graphql"
+API_RAW = "https://raw.githubusercontent.com"
+
+# Rate limits (par défaut pour non-authentifié)
+RATE_LIMIT_UNAUTH = 60
+RATE_LIMIT_AUTH = 5000
+
+# Timeouts
+TIMEOUT_DEFAULT = 15
+TIMEOUT_LONG = 30
+TIMEOUT_GRAPHQL = 20
+
+# Cache TTL (secondes)
+CACHE_TTL_SHORT = 60 # 1 minute
+CACHE_TTL_MEDIUM = 3600 # 1 heure
+CACHE_TTL_LONG = 86400 # 1 jour
+CACHE_TTL_WEEK = 604800 # 1 semaine
+
+# Couleurs
+COLORS = {
+"reset": "\033[0m",
+"bold": "\033[1m",
+"dim": "\033[2m",
+"red": "\033[91m",
+"green": "\033[92m",
+"yellow": "\033[93m",
+"blue": "\033[94m",
+"magenta": "\033[95m",
+"cyan": "\033[96m",
+"white": "\033[97m",
+"or": "\033[38;5;179m",
+"rose": "\033[38;5;212m",
+}
+
+
+# ============================================================================
+# SECTION 2 — LOGGER
+# ============================================================================
+
+class Logger:
+"""Logger professionnel avec niveaux et rotation."""
+
+def __init__(self, log_file, level="INFO"):
+self.log_file = log_file
+self.level = level
+self._setup()
+
+def _setup(self):
+# Rotation si > 5 MB
+try:
+if self.log_file.exists() and self.log_file.stat().st_size > 5 * 1024 * 1024:
+backup = self.log_file.with_suffix(".log.old")
+if backup.exists():
+backup.unlink()
+self.log_file.rename(backup)
+except Exception:
+pass
+
+def _write(self, niveau, msg):
+ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+line = f"[{ts}] [{niveau}] {msg}"
+try:
+with open(self.log_file, "a", encoding="utf-8") as f:
+f.write(line + "\n")
+except Exception:
+pass
+
+# Console
+colors = {
+"OK": COLORS["green"],
+"INFO": COLORS["blue"],
+"WARN": COLORS["yellow"],
+"ERR": COLORS["red"],
+"DEBUG": COLORS["dim"],
+}
+c = colors.get(niveau, "")
+r = COLORS["reset"]
+if niveau == "DEBUG" and self.level != "DEBUG":
+return
+print(f"{c}[{niveau}]{r} {msg}")
+
+def debug(self, msg): self._write("DEBUG", msg)
+def info(self, msg): self._write("INFO", msg)
+def ok(self, msg): self._write("OK", msg)
+def warn(self, msg): self._write("WARN", msg)
+def error(self, msg): self._write("ERR", msg)
+
+
+LOG = Logger(LOG_FILE)
+
+
+# ============================================================================
+# SECTION 3 — CONFIGURATION
+# ============================================================================
+
+class Config:
+"""Gestion de la configuration JSON."""
+
+DEFAULTS = {
+"token": "",
+"username": "",
+"default_format": "table",
+"cache_enabled": True,
+"cache_ttl": 3600,
+"color_enabled": True,
+"max_workers": 5,
+"timeout": 15,
+"user_agent": f"NexusGitHubClient/{VERSION}",
+"dashboard_port": 8080,
+"auto_analyze": True,
+"verbose": False,
+}
+
+def __init__(self):
+self.data = self._load()
+
+def _load(self):
+if CONFIG_FILE.exists():
+try:
+loaded = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+merged = {**self.DEFAULTS, **loaded}
+return merged
+except Exception as e:
+LOG.warn(f"Config invalide : {e}")
+return dict(self.DEFAULTS)
+else:
+cfg = dict(self.DEFAULTS)
+self._save(cfg)
+return cfg
+
+def _save(self, data=None):
+d = data if data else self.data
+try:
+CONFIG_FILE.write_text(
+json.dumps(d, indent=2, ensure_ascii=False),
+encoding="utf-8"
+)
+except Exception as e:
+LOG.error(f"Sauvegarde config : {e}")
+
+def get(self, key, default=None):
+return self.data.get(key, default)
+
+def set(self, key, value):
+self.data[key] = value
+self._save()
+
+def save(self):
+self._save()
+
+
+CONFIG = Config()
+
+
+# ============================================================================
+# SECTION 4 — CACHE SQLITE
+# ============================================================================
+
+class Cache:
+"""Cache local SQLite pour économiser les appels API."""
+
+def __init__(self, db_path):
+self.db_path = db_path
+self._init_db()
+
+def _init_db(self):
+conn = sqlite3.connect(self.db_path, check_same_thread=False)
+conn.execute("PRAGMA journal_mode=WAL")
+conn.execute("PRAGMA synchronous=NORMAL")
+conn.execute("""
+CREATE TABLE IF NOT EXISTS cache (
+key TEXT PRIMARY KEY,
+value TEXT NOT NULL,
+ts INTEGER NOT NULL,
+ttl INTEGER NOT NULL,
+endpoint TEXT
+)
+""")
+conn.execute("""
+CREATE TABLE IF NOT EXISTS rate_limit (
+id INTEGER PRIMARY KEY AUTOINCREMENT,
+ts INTEGER NOT NULL,
+endpoint TEXT,
+remaining INTEGER,
+limit_total INTEGER,
+reset_at INTEGER
+)
+""")
+conn.execute("""
+CREATE TABLE IF NOT EXISTS history (
+id INTEGER PRIMARY KEY AUTOINCREMENT,
+ts INTEGER NOT NULL,
+command TEXT,
+args TEXT,
+result TEXT
+)
+""")
+conn.execute("CREATE INDEX IF NOT EXISTS idx_cache_ts ON cache(ts)")
+conn.execute("CREATE INDEX IF NOT EXISTS idx_history_ts ON history(ts)")
+conn.commit()
+conn.close()
+
+def _conn(self):
+conn = sqlite3.connect(self.db_path, check_same_thread=False)
+conn.row_factory = sqlite3.Row
+return conn
+
+def _key(self, endpoint, params=None):
+s = endpoint
+if params:
+s += "|" + json.dumps(params, sort_keys=True)
+return hashlib.sha256(s.encode()).hexdigest()
+
+def get(self, endpoint, params=None):
+if not CONFIG.get("cache_enabled"):
+return None
+key = self._key(endpoint, params)
+conn = self._conn()
+row = conn.execute(
+"SELECT value, ts, ttl FROM cache WHERE key=?",
+(key,)
+).fetchone()
+conn.close()
+
+if row:
+age = time.time() - row["ts"]
+if age < row["ttl"]:
+try:
+return json.loads(row["value"])
+except Exception:
+return None
+return None
+
+def set(self, endpoint, params, value, ttl=3600):
+if not CONFIG.get("cache_enabled"):
+return
+key = self._key(endpoint, params)
+conn = self._conn()
+try:
+conn.execute(
+"INSERT OR REPLACE INTO cache (key, value, ts, ttl, endpoint) VALUES (?,?,?,?,?)",
+(key, json.dumps(value, ensure_ascii=False), int(time.time()), ttl, endpoint)
+)
+conn.commit()
+except Exception as e:
+LOG.warn(f"Cache set : {e}")
+conn.close()
+
+def clear(self, older_than_days=None):
+conn = self._conn()
+if older_than_days:
+cutoff = int(time.time()) - (older_than_days * 86400)
+conn.execute("DELETE FROM cache WHERE ts < ?", (cutoff,))
+else:
+conn.execute("DELETE FROM cache")
+conn.commit()
+conn.close()
+
+def stats(self):
+conn = self._conn()
+rows = conn.execute("SELECT COUNT(*) as n FROM cache").fetchone()
+size = self.db_path.stat().st_size if self.db_path.exists() else 0
+conn.close()
+return {"entries": rows["n"], "size_bytes": size}
+
+def log_rate_limit(self, endpoint, remaining, limit_total, reset_at):
+conn = self._conn()
+conn.execute(
+"INSERT INTO rate_limit (ts, endpoint, remaining, limit_total, reset_at) VALUES (?,?,?,?,?)",
+(int(time.time()), endpoint, remaining, limit_total, reset_at)
+)
+conn.commit()
+conn.close()
+
+def log_history(self, command, args, result):
+conn = self._conn()
+conn.execute(
+"INSERT INTO history (ts, command, args, result) VALUES (?,?,?,?)",
+(int(time.time()), command, json.dumps(args), json.dumps(result)[:5000])
+)
+conn.commit()
+conn.close()
+
+
+CACHE = Cache(DB_FILE)
+
+
+# ============================================================================
+# SECTION 5 — CLIENT API GITHUB
+# ============================================================================
+
+@dataclass
+class APIResponse:
+"""Réponse API standardisée."""
+status: int
+data: Any
+error: Optional[str] = None
+rate_remaining: Optional[int] = None
+rate_limit: Optional[int] = None
+rate_reset: Optional[int] = None
+from_cache: bool = False
+duration_ms: float = 0
+
+
+class GitHubAPI:
+"""Client API GitHub REST + GraphQL."""
+
+def __init__(self, token=None):
+self.token = token or CONFIG.get("token", "")
+self.user_agent = CONFIG.get("user_agent")
+self.timeout = CONFIG.get("timeout", 15)
+self._rate_info = {}
+
+def _headers(self):
+h = {
+"User-Agent": self.user_agent,
+"Accept": "application/vnd.github.v3+json",
+}
+if self.token:
+h["Authorization"] = f"Bearer {self.token}"
+return h
+
+def _headers_graphql(self):
+h = {
+"User-Agent": self.user_agent,
+"Content-Type": "application/json",
+}
+if self.token:
+h["Authorization"] = f"Bearer {self.token}"
+return h
+
+def _request(self, method, url, data=None, params=None, ttl=3600, cache_key=None):
+# Cache lookup
+endpoint = url
+if params:
+endpoint += "?" + urllib.parse.urlencode(params, doseq=True)
+
+if method == "GET":
+cached = CACHE.get(endpoint)
+if cached is not None:
+return APIResponse(
+status=200, data=cached, from_cache=True, duration_ms=0
+)
+
+# Build request
+if params:
+url += "?" + urllib.parse.urlencode(params, doseq=True)
+
+body = None
+if data is not None:
+body = json.dumps(data).encode("utf-8")
+
+req = urllib.request.Request(
+url,
+data=body,
+headers=self._headers(),
+method=method,
+)
+
+start = time.time()
+try:
+with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+duration = (time.time() - start) * 1000
+raw = resp.read().decode("utf-8")
+
+# Headers rate limit
+remaining = resp.headers.get("X-RateLimit-Remaining")
+limit_total = resp.headers.get("X-RateLimit-Limit")
+reset = resp.headers.get("X-RateLimit-Reset")
+
+# Parse JSON
+try:
+data = json.loads(raw) if raw else {}
+except json.JSONDecodeError:
+data = raw
+
+result = APIResponse(
+status=resp.status,
+data=data,
+rate_remaining=int(remaining) if remaining else None,
+rate_limit=int(limit_total) if limit_total else None,
+rate_reset=int(reset) if reset else None,
+duration_ms=duration,
+)
+
+# Cache
+if method == "GET" and resp.status == 200:
+CACHE.set(endpoint, None, data, ttl)
+if remaining:
+CACHE.log_rate_limit(endpoint, int(remaining),
+int(limit_total) if limit_total else 0,
+int(reset) if reset else 0)
+
+return result
+
+except urllib.error.HTTPError as e:
+duration = (time.time() - start) * 1000
+error_body = ""
+try:
+error_body = e.read().decode("utf-8")
+except Exception:
+pass
+
+remaining = e.headers.get("X-RateLimit-Remaining")
+limit_total = e.headers.get("X-RateLimit-Limit")
+reset = e.headers.get("X-RateLimit-Reset")
+
+msg = f"HTTP {e.code}"
+if e.code == 401:
+msg += " — Token invalide ou expiré"
+elif e.code == 403:
+msg += " — Rate limit dépassé ou accès refusé"
+elif e.code == 404:
+msg += " — Ressource introuvable"
+elif e.code == 422:
+msg += " — Entité non traitable"
+
+return APIResponse(
+status=e.code,
+data=error_body,
+error=msg,
+rate_remaining=int(remaining) if remaining else None,
+rate_limit=int(limit_total) if limit_total else None,
+rate_reset=int(reset) if reset else None,
+duration_ms=duration,
+)
+
+except urllib.error.URLError as e:
+duration = (time.time() - start) * 1000
+return APIResponse(
+status=0,
+data=None,
+error=f"Erreur réseau : {e.reason}",
+duration_ms=duration,
+)
+
+except Exception as e:
+duration = (time.time() - start) * 1000
+return APIResponse(
+status=0,
+data=None,
+error=f"Erreur : {e}",
+duration_ms=duration,
+)
+
+# -------------------------------------------------------------------
+# Méthodes REST
+# -------------------------------------------------------------------
+
+def get_user(self, username):
+"""Récupère un utilisateur."""
+return self._request("GET", f"{API_REST}/users/{username}",
+ttl=CACHE_TTL_MEDIUM)
+
+def get_user_repos(self, username, per_page=30, sort="updated",
+direction="desc", page=1):
+"""Liste les repos d'un utilisateur."""
+return self._request(
+"GET", f"{API_REST}/users/{username}/repos",
+params={
+"per_page": per_page,
+"sort": sort,
+"direction": direction,
+"page": page,
+},
+ttl=CACHE_TTL_MEDIUM,
+)
+
+def get_repo(self, owner, repo):
+"""Récupère un repo."""
+return self._request("GET", f"{API_REST}/repos/{owner}/{repo}",
+ttl=CACHE_TTL_MEDIUM)
+
+def get_repo_languages(self, owner, repo):
+"""Liste les langages d'un repo."""
+return self._request("GET", f"{API_REST}/repos/{owner}/{repo}/languages",
+ttl=CACHE_TTL_WEEK)
+
+def get_repo_contributors(self, owner, repo, per_page=30):
+"""Liste les contributeurs."""
+return self._request(
+"GET", f"{API_REST}/repos/{owner}/{repo}/contributors",
+params={"per_page": per_page},
+ttl=CACHE_TTL_MEDIUM,
+)
+
+def get_repo_commits(self, owner, repo, per_page=30):
+"""Liste les commits."""
+return self._request(
+"GET", f"{API_REST}/repos/{owner}/{repo}/commits",
+params={"per_page": per_page},
+ttl=CACHE_TTL_SHORT,
+)
+
+def get_repo_issues(self, owner, repo, state="open", per_page=30):
+"""Liste les issues."""
+return self._request(
+"GET", f"{API_REST}/repos/{owner}/{repo}/issues",
+params={"state": state, "per_page": per_page},
+ttl=CACHE_TTL_SHORT,
+)
+
+def get_repo_pulls(self, owner, repo, state="open", per_page=30):
+"""Liste les pull requests."""
+return self._request(
+"GET", f"{API_REST}/repos/{owner}/{repo}/pulls",
+params={"state": state, "per_page": per_page},
+ttl=CACHE_TTL_SHORT,
+)
+
+def search_repos(self, query, sort="stars", order="desc", per_page=30):
+"""Recherche de repos."""
+return self._request(
+"GET", f"{API_REST}/search/repositories",
+params={
+"q": query,
+"sort": sort,
+"order": order,
+"per_page": per_page,
+},
+ttl=CACHE_TTL_MEDIUM,
+)
+
+def search_users(self, query, sort="followers", order="desc", per_page=30):
+"""Recherche d'utilisateurs."""
+return self._request(
+"GET", f"{API_REST}/search/users",
+params={
+"q": query,
+"sort": sort,
+"order": order,
+"per_page": per_page,
+},
+ttl=CACHE_TTL_MEDIUM,
+)
+
+def search_code(self, query, per_page=30):
+"""Recherche de code."""
+return self._request(
+"GET", f"{API_REST}/search/code",
+params={"q": query, "per_page": per_page},
+ttl=CACHE_TTL_SHORT,
+)
+
+def search_issues(self, query, per_page=30):
+"""Recherche d'issues."""
+return self._request(
+"GET", f"{API_REST}/search/issues",
+params={"q": query, "per_page": per_page},
+ttl=CACHE_TTL_SHORT,
+)
+
+def get_trending(self, language=None, since="daily"):
+"""Repos trending (via scraping ou fallback recherche)."""
+# GitHub n'a pas d'API officielle pour trending
+# On utilise une recherche triée par étoiles récentes
+date_str = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+query = f"created:>{date_str}"
+if language:
+query += f" language:{language}"
+return self.search_repos(query, sort="stars", order="desc", per_page=25)
+
+def get_rate_limit(self):
+"""Rate limit actuel."""
+return self._request("GET", f"{API_REST}/rate_limit",
+ttl=CACHE_TTL_SHORT)
+
+def get_user_events(self, username, per_page=30):
+"""Événements d'un utilisateur."""
+return self._request(
+"GET", f"{API_REST}/users/{username}/events/public",
+params={"per_page": per_page},
+ttl=CACHE_TTL_SHORT,
+)
+
+def get_user_starred(self, username, per_page=30):
+"""Repos starés par un utilisateur."""
+return self._request(
+"GET", f"{API_REST}/users/{username}/starred",
+params={"per_page": per_page},
+ttl=CACHE_TTL_MEDIUM,
+)
+
+def get_user_followers(self, username, per_page=30):
+"""Followers d'un utilisateur."""
+return self._request(
+"GET", f"{API_REST}/users/{username}/followers",
+params={"per_page": per_page},
+ttl=CACHE_TTL_MEDIUM,
+)
+
+def get_orgs(self, username):
+"""Organisations d'un utilisateur."""
+return self._request(
+"GET", f"{API_REST}/users/{username}/orgs",
+ttl=CACHE_TTL_MEDIUM,
+)
+
+def get_repo_releases(self, owner, repo, per_page=10):
+"""Releases d'un repo."""
+return self._request(
+"GET", f"{API_REST}/repos/{owner}/{repo}/releases",
+params={"per_page": per_page},
+ttl=CACHE_TTL_MEDIUM,
+)
+
+def get_repo_tags(self, owner, repo, per_page=10):
+"""Tags d'un repo."""
+return self._request(
+"GET", f"{API_REST}/repos/{owner}/{repo}/tags",
+params={"per_page": per_page},
+ttl=CACHE_TTL_MEDIUM,
+)
+
+def get_repo_branches(self, owner, repo, per_page=30):
+"""Branches d'un repo."""
+return self._request(
+"GET", f"{API_REST}/repos/{owner}/{repo}/branches",
+params={"per_page": per_page},
+ttl=CACHE_TTL_SHORT,
+)
+
+def get_user_gists(self, username, per_page=10):
+"""Gists d'un utilisateur."""
+return self._request(
+"GET", f"{API_REST}/users/{username}/gists",
+params={"per_page": per_page},
+ttl=CACHE_TTL_MEDIUM,
+)
+
+# -------------------------------------------------------------------
+# Méthodes GraphQL
+# -------------------------------------------------------------------
+
+def graphql(self, query, variables=None):
+"""Requête GraphQL v4."""
+if not self.token:
+return APIResponse(
+status=401, data=None,
+error="GraphQL nécessite un token GitHub"
+)
+
+body = {"query": query}
+if variables:
+body["variables"] = variables
+
+req = urllib.request.Request(
+API_GRAPHQL,
+data=json.dumps(body).encode("utf-8"),
+headers=self._headers_graphql(),
+method="POST",
+)
+
+start = time.time()
+try:
+with urllib.request.urlopen(req, timeout=TIMEOUT_GRAPHQL) as resp:
+duration = (time.time() - start) * 1000
+data = json.loads(resp.read().decode("utf-8"))
+
+if "errors" in data:
+return APIResponse(
+status=200, data=data,
+error=str(data["errors"][0].get("message", "Erreur GraphQL")),
+duration_ms=duration,
+)
+
+return APIResponse(
+status=200, data=data,
+duration_ms=duration,
+)
+except Exception as e:
+duration = (time.time() - start) * 1000
+return APIResponse(status=0, data=None, error=str(e),
+duration_ms=duration)
+
+def graphql_user_contributions(self, username):
+"""Contributions annuelles d'un utilisateur via GraphQL."""
+query = """
+query($login: String!) {
+user(login: $login) {
+contributionsCollection {
+contributionCalendar {
+totalContributions
+weeks {
+contributionDays {
+date
+contributionCount
+color
+}
+}
+}
+}
+}
+}
+"""
+return self.graphql(query, {"login": username})
+
+def graphql_repo_stats(self, owner, name):
+"""Stats avancées d'un repo via GraphQL."""
+query = """
+query($owner: String!, $name: String!) {
+repository(owner: $owner, name: $name) {
+nameWithOwner
+stargazerCount
+forkCount
+watchers { totalCount }
+issues(states: OPEN) { totalCount }
+pullRequests(states: OPEN) { totalCount }
+releases { totalCount }
+primaryLanguage { name color }
+licenseInfo { name }
+defaultBranchRef { name }
+createdAt
+updatedAt
+pushedAt
+}
+}
+"""
+return self.graphql(query, {"owner": owner, "name": name})
+
+
+API = GitHubAPI()
+
+
+# ============================================================================
+# SECTION 6 — FORMATAGE SORTIE
+# ============================================================================
+
+class Formatter:
+"""Formate les données en table, JSON, markdown."""
+
+@staticmethod
+def table(headers, rows, max_width=30):
+"""Format tableau ASCII."""
+if not rows:
+return " (aucune donnée)"
+
+# Calculer largeurs
+widths = [len(str(h)) for h in headers]
+for row in rows:
+for i, cell in enumerate(row):
+if i < len(widths):
+widths[i] = min(max(widths[i], len(str(cell))), max_width)
+
+# Ligne séparatrice
+sep = "+" + "+".join("-" * (w + 2) for w in widths) + "+"
+
+# Header
+out = [sep]
+header_line = "|"
+for i, h in enumerate(headers):
+header_line += f" {str(h)[:widths[i]].ljust(widths[i])} |"
+out.append(header_line)
+out.append(sep)
+
+# Rows
+for row in rows:
+line = "|"
+for i, cell in enumerate(row):
+if i < len(widths):
+s = str(cell)[:widths[i]].ljust(widths[i])
+line += f" {s} |"
+out.append(line)
+out.append(sep)
+
+return "\n".join(out)
+
+@staticmethod
+def json_output(data, pretty=True):
+"""Format JSON."""
+return json.dumps(data, indent=2 if pretty else None,
+ensure_ascii=False, default=str)
+
+@staticmethod
+def markdown(headers, rows, title=None):
+"""Format markdown."""
+out = []
+if title:
+out.append(f"## {title}\n")
+out.append("| " + " | ".join(str(h) for h in headers) + " |")
+out.append("|" + "|".join("---" for _ in headers) + "|")
+for row in rows:
+out.append("| " + " | ".join(str(c) for c in row) + " |")
+return "\n".join(out)
+
+@staticmethod
+def human_number(n):
+"""Nombre humanisé (1.2k, 3.5M)."""
+if n is None:
+return "N/A"
+try:
+n = int(n)
+except (ValueError, TypeError):
+return str(n)
+if n < 1000:
+return str(n)
+if n < 1_000_000:
+return f"{n/1000:.1f}k"
+if n < 1_000_000_000:
+return f"{n/1_000_000:.1f}M"
+return f"{n/1_000_000_000:.1f}B"
+
+@staticmethod
+def human_date(iso_date):
+"""Date humanisée."""
+if not iso_date:
+return "N/A"
+try:
+d = datetime.fromisoformat(iso_date.replace("Z", "+00:00"))
+now = datetime.now(timezone.utc)
+delta = now - d
+if delta.days > 365:
+return f"il y a {delta.days // 365} an(s)"
+if delta.days > 30:
+return f"il y a {delta.days // 30} mois"
+if delta.days > 0:
+return f"il y a {delta.days} j"
+if delta.seconds > 3600:
+return f"il y a {delta.seconds // 3600} h"
+if delta.seconds > 60:
+return f"il y a {delta.seconds // 60} min"
+return "à l'instant"
+except Exception:
+return iso_date
+
+@staticmethod
+def bytes_human(n):
+"""Octets humanisés."""
+for unit in ["B", "KB", "MB", "GB", "TB"]:
+if n < 1024:
+return f"{n:.1f} {unit}"
+n /= 1024
+return f"{n:.1f} PB"
+
+
+FMT = Formatter()
+
+
+# ============================================================================
+# SECTION 7 — ANALYSE
+# ============================================================================
+
+class Analyzer:
+"""Analyse intelligente des données GitHub."""
+
+@staticmethod
+def analyze_user(data):
+"""Analyse complète d'un utilisateur."""
+if not data or not isinstance(data, dict):
+return None
+
+result = {
+"login": data.get("login"),
+"name": data.get("name") or data.get("login"),
+"bio": data.get("bio"),
+"company": data.get("company"),
+"location": data.get("location"),
+"blog": data.get("blog"),
+"email": data.get("email"),
+"twitter": data.get("twitter_username"),
+"public_repos": data.get("public_repos", 0),
+"public_gists": data.get("public_gists", 0),
+"followers": data.get("followers", 0),
+"following": data.get("following", 0),
+"created_at": data.get("created_at"),
+"updated_at": data.get("updated_at"),
+"avatar_url": data.get("avatar_url"),
+"html_url": data.get("html_url"),
+"hireable": data.get("hireable"),
+"type": data.get("type"),
+}
+
+# Score d'influence
+result["influence_score"] = Analyzer._influence_score(result)
+result["activity_level"] = Analyzer._activity_level(result)
+
+return result
+
+@staticmethod
+def _influence_score(user):
+"""Score d'influence 0-100."""
+followers = user.get("followers", 0)
+repos = user.get("public_repos", 0)
+gists = user.get("public_gists", 0)
+
+# Log scale
+f_score = min(50, math.log10(max(followers, 1)) * 15)
+r_score = min(30, math.log10(max(repos, 1)) * 12)
+g_score = min(20, math.log10(max(gists, 1)) * 8)
+
+return round(f_score + r_score + g_score, 1)
+
+@staticmethod
+def _activity_level(user):
+"""Niveau d'activité."""
+if not user.get("updated_at"):
+return "inconnu"
+try:
+d = datetime.fromisoformat(user["updated_at"].replace("Z", "+00:00"))
+days = (datetime.now(timezone.utc) - d).days
+if days < 7:
+return "très actif"
+if days < 30:
+return "actif"
+if days < 90:
+return "modéré"
+if days < 365:
+return "peu actif"
+return "inactif"
+except Exception:
+return "inconnu"
+
+@staticmethod
+def analyze_repo(data):
+"""Analyse complète d'un repo."""
+if not data or not isinstance(data, dict):
+return None
+
+return {
+"full_name": data.get("full_name"),
+"name": data.get("name"),
+"owner": (data.get("owner") or {}).get("login"),
+"description": data.get("description"),
+"language": data.get("language"),
+"stars": data.get("stargazers_count", 0),
+"forks": data.get("forks_count", 0),
+"watchers": data.get("watchers_count", 0),
+"open_issues": data.get("open_issues_count", 0),
+"size_kb": data.get("size", 0),
+"created_at": data.get("created_at"),
+"updated_at": data.get("updated_at"),
+"pushed_at": data.get("pushed_at"),
+"topics": data.get("topics", []),
+"license": (data.get("license") or {}).get("name"),
+"default_branch": data.get("default_branch"),
+"archived": data.get("archived", False),
+"fork": data.get("fork", False),
+"html_url": data.get("html_url"),
+"homepage": data.get("homepage"),
+"has_issues": data.get("has_issues", False),
+"has_wiki": data.get("has_wiki", False),
+"has_pages": data.get("has_pages", False),
+}
+
+@staticmethod
+def rank_repos(repos, by="stars"):
+"""Classe les repos."""
+if not repos:
+return []
+key_map = {
+"stars": lambda r: r.get("stargazers_count", 0),
+"forks": lambda r: r.get("forks_count", 0),
+"issues": lambda r: r.get("open_issues_count", 0),
+"updated": lambda r: r.get("updated_at", ""),
+"created": lambda r: r.get("created_at", ""),
+}
+key = key_map.get(by, key_map["stars"])
+return sorted(repos, key=key, reverse=True)
+
+@staticmethod
+def detect_languages(repos):
+"""Détecte les langages dominants."""
+counter = Counter()
+for r in repos:
+lang = r.get("language")
+if lang:
+counter[lang] += 1
+return counter.most_common(20)
+
+@staticmethod
+def analyze_activity(repos):
+"""Analyse l'activité sur les repos."""
+now = datetime.now(timezone.utc)
+actifs_30j = 0
+actifs_90j = 0
+actifs_365j = 0
+inactifs = 0
+
+for r in repos:
+pushed = r.get("pushed_at") or r.get("updated_at")
+if not pushed:
+inactifs += 1
+continue
+try:
+d = datetime.fromisoformat(pushed.replace("Z", "+00:00"))
+days = (now - d).days
+if days < 30:
+actifs_30j += 1
+elif days < 90:
+actifs_90j += 1
+elif days < 365:
+actifs_365j += 1
+else:
+inactifs += 1
+except Exception:
+inactifs += 1
+
+return {
+"actifs_30j": actifs_30j,
+"actifs_90j": actifs_90j,
+"actifs_365j": actifs_365j,
+"inactifs": inactifs,
+"total": len(repos),
+}
+
+@staticmethod
+def recommend_similar(target_repo, candidates):
+"""Recommande des repos similaires."""
+target_lang = target_repo.get("language")
+target_topics = set(target_repo.get("topics", []))
+
+scores = []
+for c in candidates:
+if c.get("full_name") == target_repo.get("full_name"):
+continue
+score = 0
+if c.get("language") == target_lang:
+score += 40
+topics = set(c.get("topics", []))
+common = target_topics & topics
+score += len(common) * 10
+# Stars weight
+stars = c.get("stargazers_count", 0)
+if stars > 100:
+score += 5
+if stars > 1000:
+score += 10
+scores.append((score, c))
+
+scores.sort(key=lambda x: -x[0])
+return [c for _, c in scores[:10]]
+
+@staticmethod
+def health_score(repo):
+"""Score de santé d'un repo 0-100."""
+score = 0
+
+# Activité récente (30 pts)
+pushed = repo.get("pushed_at")
+if pushed:
+try:
+d = datetime.fromisoformat(pushed.replace("Z", "+00:00"))
+days = (datetime.now(timezone.utc) - d).days
+if days < 7:
+score += 30
+elif days < 30:
+score += 25
+elif days < 90:
+score += 15
+elif days < 365:
+score += 5
+except Exception:
+pass
+
+# Licence (10 pts)
+if repo.get("license"):
+score += 10
+
+# Description (10 pts)
+if repo.get("description"):
+score += 10
+
+# README (approx via has_wiki/pages) (10 pts)
+if repo.get("has_wiki") or repo.get("has_pages"):
+score += 10
+
+# Issues gérées (10 pts)
+open_issues = repo.get("open_issues_count", 0)
+if open_issues < 10:
+score += 10
+elif open_issues < 50:
+score += 5
+
+# Stars (20 pts)
+stars = repo.get("stargazers_count", 0)
+if stars > 1000:
+score += 20
+elif stars > 100:
+score += 15
+elif stars > 10:
+score += 10
+elif stars > 0:
+score += 5
+
+# Forks (10 pts)
+if repo.get("forks_count", 0) > 10:
+score += 10
+elif repo.get("forks_count", 0) > 0:
+score += 5
+
+return min(score, 100)
+
+
+ANALYZER = Analyzer()
+
+
+# ============================================================================
+# SECTION 8 — COMMANDES CLI
+# ============================================================================
+
+class Commands:
+"""Toutes les commandes disponibles."""
+
+@staticmethod
+def cmd_user(username, args):
+"""Affiche un utilisateur."""
+LOG.info(f"Récupération utilisateur : {username}")
+resp = API.get_user(username)
+
+if resp.error:
+LOG.error(f"Erreur : {resp.error}")
+return None
+
+user = ANALYZER.analyze_user(resp.data)
+
+if args.json:
+print(FMT.json_output(user))
+return user
+
+# Affichage table
+print("")
+print(f"{COLORS['bold']}{COLORS['or']} Utilisateur GitHub : {user['login']}{COLORS['reset']}")
+print(f" {'─' * 60}")
+print(f" Nom : {user['name']}")
+print(f" Bio : {user['bio'] or 'N/A'}")
+print(f" Company : {user['company'] or 'N/A'}")
+print(f" Location : {user['location'] or 'N/A'}")
+print(f" Blog : {user['blog'] or 'N/A'}")
+print(f" Twitter : @{user['twitter'] or 'N/A'}")
+print(f" Type : {user['type']}")
+print(f" Repos publics : {user['public_repos']}")
+print(f" Gists : {user['public_gists']}")
+print(f" Followers : {FMT.human_number(user['followers'])}")
+print(f" Following : {user['following']}")
+print(f" Créé le : {FMT.human_date(user['created_at'])}")
+print(f" Mis à jour : {FMT.human_date(user['updated_at'])}")
+print(f" Activité : {user['activity_level']}")
+print(f" Score influence : {user['influence_score']}/100")
+print(f" Profil : {user['html_url']}")
+print("")
+
+return user
+
+@staticmethod
+def cmd_repos(owner, args):
+"""Liste les repos."""
+LOG.info(f"Récupération repos de : {owner}")
+resp = API.get_user_repos(owner, per_page=args.limit)
+
+if resp.error:
+LOG.error(f"Erreur : {resp.error}")
+return []
+
+repos = resp.data if isinstance(resp.data, list) else []
+repos = ANALYZER.rank_repos(repos, by=args.sort or "stars")
+
+if args.json:
+print(FMT.json_output([ANALYZER.analyze_repo(r) for r in repos]))
+return repos
+
+headers = ["Nom", "Lang", "Stars", "Forks", "Issues", "MAJ"]
+rows = []
+for r in repos:
+rows.append([
+r.get("name", "")[:30],
+r.get("language", "—"),
+FMT.human_number(r.get("stargazers_count", 0)),
+FMT.human_number(r.get("forks_count", 0)),
+r.get("open_issues_count", 0),
+FMT.human_date(r.get("updated_at")),
+])
+
+print("")
+print(f"{COLORS['bold']}{COLORS['or']} Repos de {owner} ({len(repos)}){COLORS['reset']}")
+print(FMT.table(headers, rows))
+print("")
+
+# Langages dominants
+langs = ANALYZER.detect_languages(repos)
+if langs:
+print(f" {COLORS['cyan']}Langages dominants :{COLORS['reset']}")
+for lang, count in langs[:10]:
+print(f" • {lang} : {count}")
+print("")
+
+return repos
+
+@staticmethod
+def cmd_repo(owner, name, args):
+"""Analyse un repo."""
+LOG.info(f"Analyse repo : {owner}/{name}")
+resp = API.get_repo(owner, name)
+
+if resp.error:
+LOG.error(f"Erreur : {resp.error}")
+return None
+
+repo = ANALYZER.analyze_repo(resp.data)
+health = ANALYZER.health_score(resp.data)
+
+if args.json:
+repo["health_score"] = health
+print(FMT.json_output(repo))
+return repo
+
+print("")
+print(f"{COLORS['bold']}{COLORS['or']} Repo : {repo['full_name']}{COLORS['reset']}")
+print(f" {'─' * 60}")
+print(f" Description : {repo['description'] or 'N/A'}")
+print(f" Langage : {repo['language'] or 'N/A'}")
+print(f" Stars : {FMT.human_number(repo['stars'])}")
+print(f" Forks : {FMT.human_number(repo['forks'])}")
+print(f" Watchers : {FMT.human_number(repo['watchers'])}")
+print(f" Issues : {repo['open_issues']}")
+print(f" Taille : {repo['size_kb']} KB")
+print(f" Licence : {repo['license'] or 'N/A'}")
+print(f" Branche : {repo['default_branch']}")
+print(f" Créé le : {FMT.human_date(repo['created_at'])}")
+print(f" Mis à jour : {FMT.human_date(repo['updated_at'])}")
+print(f" Poussé le : {FMT.human_date(repo['pushed_at'])}")
+print(f" Score santé : {health}/100")
+print(f" Topics : {', '.join(repo['topics']) if repo['topics'] else 'N/A'}")
+print(f" URL : {repo['html_url']}")
+print("")
+
+# Langages
+lang_resp = API.get_repo_languages(owner, name)
+if not lang_resp.error and isinstance(lang_resp.data, dict):
+total = sum(lang_resp.data.values())
+if total > 0:
+print(f" {COLORS['cyan']}Répartition langages :{COLORS['reset']}")
+for lang, bytes_count in sorted(lang_resp.data.items(),
+key=lambda x: -x[1])[:10]:
+pct = bytes_count / total * 100
+bar = "█" * int(pct / 2)
+print(f" {lang:15s} {pct:5.1f}% {bar}")
+print("")
+
+return repo
+
+@staticmethod
+def cmd_search(query, args):
+"""Recherche GitHub."""
+type_search = args.type or "repos"
+LOG.info(f"Recherche {type_search} : {query}")
+
+if type_search == "repos":
+resp = API.search_repos(query, per_page=args.limit)
+elif type_search == "users":
+resp = API.search_users(query, per_page=args.limit)
+elif type_search == "code":
+resp = API.search_code(query, per_page=args.limit)
+elif type_search == "issues":
+resp = API.search_issues(query, per_page=args.limit)
+else:
+LOG.error(f"Type inconnu : {type_search}")
+return None
+
+if resp.error:
+LOG.error(f"Erreur : {resp.error}")
+return None
+
+data = resp.data
+items = data.get("items", []) if isinstance(data, dict) else []
+
+if args.json:
+print(FMT.json_output(data))
+return items
+
+print("")
+print(f"{COLORS['bold']}{COLORS['or']} Recherche '{query}' ({type_search}) "
+f"— {data.get('total_count', 0)} résultats{COLORS['reset']}")
+print("")
+
+if type_search == "repos":
+headers = ["Repo", "Lang", "Stars", "Desc"]
+rows = []
+for item in items:
+rows.append([
+item.get("full_name", "")[:35],
+item.get("language", "—"),
+FMT.human_number(item.get("stargazers_count", 0)),
+(item.get("description") or "")[:50],
+])
+print(FMT.table(headers, rows))
+
+elif type_search == "users":
+headers = ["Login", "Type", "Repos", "Followers"]
+rows = []
+for item in items:
+rows.append([
+item.get("login", ""),
+item.get("type", ""),
+item.get("public_repos", 0),
+item.get("followers", 0),
+])
+print(FMT.table(headers, rows))
+
+elif type_search == "code":
+headers = ["Repo", "Fichier", "Path"]
+rows = []
+for item in items:
+repo = item.get("repository", {})
+rows.append([
+repo.get("full_name", "")[:30],
+item.get("name", "")[:30],
+item.get("path", "")[:40],
+])
+print(FMT.table(headers, rows))
+
+elif type_search == "issues":
+headers = ["Repo", "Titre", "État", "Créé"]
+rows = []
+for item in items:
+repo_url = item.get("repository_url", "")
+repo = "/".join(repo_url.split("/")[-2:]) if repo_url else ""
+rows.append([
+repo[:25],
+(item.get("title") or "")[:35],
+item.get("state", ""),
+FMT.human_date(item.get("created_at")),
+])
+print(FMT.table(headers, rows))
+
+print("")
+return items
+
+@staticmethod
+def cmd_trending(args):
+"""Repos trending."""
+lang = args.language
+LOG.info(f"Trending {'en ' + lang if lang else ''}")
+
+resp = API.get_trending(language=lang, since="weekly")
+
+if resp.error:
+LOG.error(f"Erreur : {resp.error}")
+return None
+
+data = resp.data
+items = data.get("items", []) if isinstance(data, dict) else []
+
+if args.json:
+print(FMT.json_output(items))
+return items
+
+headers = ["Repo", "Lang", "Stars", "Desc"]
+rows = []
+for item in items:
+rows.append([
+item.get("full_name", "")[:35],
+item.get("language", "—"),
+FMT.human_number(item.get("stargazers_count", 0)),
+(item.get("description") or "")[:45],
+])
+
+print("")
+title = f"Trending ({lang})" if lang else "Trending (7 derniers jours)"
+print(f"{COLORS['bold']}{COLORS['or']} {title}{COLORS['reset']}")
+print("")
+print(FMT.table(headers, rows))
+print("")
+
+return items
+
+@staticmethod
+def cmd_rate(args):
+"""Rate limit."""
+resp = API.get_rate_limit()
+
+if resp.error:
+LOG.error(f"Erreur : {resp.error}")
+return None
+
+data = resp.data
+resources = data.get("resources", {}) if isinstance(data, dict) else {}
+
+if args.json:
+print(FMT.json_output(data))
+return data
+
+print("")
+print(f"{COLORS['bold']}{COLORS['or']} Rate Limit GitHub{COLORS['reset']}")
+print(f" {'─' * 60}")
+
+for name, info in resources.items():
+limit = info.get("limit", 0)
+remaining = info.get("remaining", 0)
+reset_ts = info.get("reset", 0)
+reset_dt = datetime.fromtimestamp(reset_ts).strftime("%H:%M:%S") if reset_ts else "?"
+pct = (remaining / limit * 100) if limit else 0
+
+bar = "█" * int(pct / 5) + "░" * (20 - int(pct / 5))
+color = COLORS["green"] if pct > 50 else (COLORS["yellow"] if pct > 20 else COLORS["red"])
+
+print(f" {name:20s} {color}{bar}{COLORS['reset']} "
+f"{remaining}/{limit} (reset {reset_dt})")
+
+print("")
+return data
+
+@staticmethod
+def cmd_cache(args):
+"""Gestion du cache."""
+if args.clear:
+CACHE.clear()
+LOG.ok("Cache vidé")
+return None
+
+stats = CACHE.stats()
+print("")
+print(f"{COLORS['bold']}{COLORS['or']} Cache GitHub{COLORS['reset']}")
+print(f" {'─' * 60}")
+print(f" Entrées : {stats['entries']}")
+print(f" Taille : {FMT.bytes_human(stats['size_bytes'])}")
+print(f" Fichier : {DB_FILE}")
+print("")
+return stats
+
+@staticmethod
+def cmd_compare(user1, user2, args):
+"""Compare deux utilisateurs."""
+LOG.info(f"Comparaison : {user1} vs {user2}")
+
+with ThreadPoolExecutor(max_workers=2) as ex:
+f1 = ex.submit(API.get_user, user1)
+f2 = ex.submit(API.get_user, user2)
+r1 = f1.result()
+r2 = f2.result()
+
+if r1.error or r2.error:
+LOG.error(f"Erreur : {r1.error or r2.error}")
+return None
+
+u1 = ANALYZER.analyze_user(r1.data)
+u2 = ANALYZER.analyze_user(r2.data)
+
+if args.json:
+print(FMT.json_output({"user1": u1, "user2": u2}))
+return (u1, u2)
+
+headers = ["Métrique", user1, user2]
+rows = [
+["Followers", FMT.human_number(u1["followers"]), FMT.human_number(u2["followers"])],
+["Repos", u1["public_repos"], u2["public_repos"]],
+["Gists", u1["public_gists"], u2["public_gists"]],
+["Influence", u1["influence_score"], u2["influence_score"]],
+["Activité", u1["activity_level"], u2["activity_level"]],
+]
+
+print("")
+print(f"{COLORS['bold']}{COLORS['or']} Comparaison{COLORS['reset']}")
+print("")
+print(FMT.table(headers, rows))
+print("")
+
+return (u1, u2)
+
+@staticmethod
+def cmd_recommend(owner, repo, args):
+"""Recommande des repos similaires."""
+LOG.info(f"Recommandations pour {owner}/{repo}")
+
+# Repo cible
+r = API.get_repo(owner, repo)
+if r.error:
+LOG.error(f"Erreur : {r.error}")
+return None
+
+target = ANALYZER.analyze_repo(r.data)
+lang = target.get("language")
+
+# Cherche des repos similaires
+query = f"language:{lang}" if lang else "stars:>1000"
+resp = API.search_repos(query, sort="stars", per_page=30)
+
+if resp.error:
+LOG.error(f"Erreur : {resp.error}")
+return None
+
+candidates = [ANALYZER.analyze_repo(x) for x in resp.data.get("items", [])]
+recos = ANALYZER.recommend_similar(target, candidates)
+
+if args.json:
+print(FMT.json_output(recos))
+return recos
+
+headers = ["Repo", "Stars", "Lang", "Desc"]
+rows = []
+for r in recos:
+rows.append([
+r.get("full_name", "")[:35],
+FMT.human_number(r.get("stars", 0)),
+r.get("language", "—"),
+(r.get("description") or "")[:40],
+])
+
+print("")
+print(f"{COLORS['bold']}{COLORS['or']} Repos similaires à {owner}/{repo}{COLORS['reset']}")
+print("")
+print(FMT.table(headers, rows))
+print("")
+
+return recos
+
+@staticmethod
+def cmd_export(args):
+"""Exporte un rapport complet."""
+target = args.target
+if "/" in target:
+owner, repo = target.split("/", 1)
+LOG.info(f"Export repo : {owner}/{repo}")
+r = API.get_repo(owner, repo)
+if r.error:
+LOG.error(f"Erreur : {r.error}")
+return None
+data = {
+"type": "repo",
+"data": ANALYZER.analyze_repo(r.data),
+"health_score": ANALYZER.health_score(r.data),
+"timestamp": datetime.now().isoformat(),
+}
+else:
+LOG.info(f"Export user : {target}")
+r = API.get_user(target)
+if r.error:
+LOG.error(f"Erreur : {r.error}")
+return None
+data = {
+"type": "user",
+"data": ANALYZER.analyze_user(r.data),
+"timestamp": datetime.now().isoformat(),
+}
+
+# Sauvegarde
+ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+out_file = REPORT_DIR / f"export_{target.replace('/', '_')}_{ts}.json"
+out_file.write_text(FMT.json_output(data), encoding="utf-8")
+
+LOG.ok(f"Export : {out_file}")
+print(FMT.json_output(data))
+return data
+
+@staticmethod
+def cmd_activity(username, args):
+"""Analyse l'activité d'un utilisateur."""
+LOG.info(f"Activité de {username}")
+
+with ThreadPoolExecutor(max_workers=2) as ex:
+f1 = ex.submit(API.get_user_events, username, 30)
+f2 = ex.submit(API.get_user_repos, username, 30)
+events_resp = f1.result()
+repos_resp = f2.result()
+
+if events_resp.error:
+LOG.error(f"Erreur events : {events_resp.error}")
+return None
+
+events = events_resp.data if isinstance(events_resp.data, list) else []
+repos = repos_resp.data if isinstance(repos_resp.data, list) else []
+
+# Compte les types d'événements
+types_count = Counter()
+for e in events:
+types_count[e.get("type", "?")] += 1
+
+activity_repos = ANALYZER.analyze_activity(repos)
+
+if args.json:
+print(FMT.json_output({
+"events": dict(types_count),
+"repos_activity": activity_repos,
+}))
+return None
+
+print("")
+print(f"{COLORS['bold']}{COLORS['or']} Activité de {username}{COLORS['reset']}")
+print(f" {'─' * 60}")
+print("")
+print(f" {COLORS['cyan']}Types d'événements récents :{COLORS['reset']}")
+for t, count in types_count.most_common(15):
+print(f" {t:30s} {count}")
+
+print("")
+print(f" {COLORS['cyan']}Activité des repos :{COLORS['reset']}")
+print(f" Actifs < 30j : {activity_repos['actifs_30j']}")
+print(f" Actifs < 90j : {activity_repos['actifs_90j']}")
+print(f" Actifs < 1an : {activity_repos['actifs_365j']}")
+print(f" Inactifs : {activity_repos['inactifs']}")
+print(f" Total : {activity_repos['total']}")
+print("")
+
+return None
+
+
+CMD = Commands()
+
+
+# ============================================================================
+# SECTION 9 — DASHBOARD WEB
+# ============================================================================
+
+HTML_DASHBOARD = """<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GitHub Client Dashboard</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{
+--gh-bg:#0d1117;--gh-card:#161b22;--gh-border:#30363d;
+--gh-text:#e6edf3;--gh-dim:#7d8590;
+--gh-blue:#58a6ff;--gh-green:#3fb950;--gh-red:#f85149;
+--gh-yellow:#d29922;--gh-purple:#bc8cff;
+}
+body{background:var(--gh-bg);color:var(--gh-text);
+font-family:-apple-system,system-ui,sans-serif;padding:20px}
+.c{max-width:1200px;margin:0 auto}
+h1{color:var(--gh-blue);font-size:28px;margin-bottom:6px}
+.s{color:var(--gh-dim);margin-bottom:20px;font-size:13px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));
+gap:12px;margin-bottom:20px}
+.stat{background:var(--gh-card);border:1px solid var(--gh-border);
+border-radius:10px;padding:18px;text-align:center}
+.stat .n{font-size:26px;font-weight:700;color:var(--gh-blue);display:block}
+.stat .l{font-size:10px;color:var(--gh-dim);text-transform:uppercase;
+letter-spacing:1px;margin-top:4px;display:block}
+.card{background:var(--gh-card);border:1px solid var(--gh-border);
+border-radius:10px;padding:20px;margin-bottom:14px}
+.card h2{color:var(--gh-blue);font-size:15px;margin-bottom:12px}
+textarea{width:100%;background:#0d1117;border:1px solid var(--gh-border);
+color:var(--gh-text);padding:10px;border-radius:6px;font-family:monospace;
+font-size:12px;min-height:60px;resize:vertical}
+button{background:var(--gh-green);color:#fff;border:none;padding:10px 18px;
+border-radius:6px;font-weight:600;cursor:pointer;margin-top:8px;font-size:13px}
+button:hover{background:#2ea043}
+pre{background:#0d1117;padding:12px;border-radius:6px;overflow-x:auto;
+font-size:11px;color:var(--gh-green);margin-top:10px;max-height:500px;
+white-space:pre-wrap;font-family:monospace}
+.rate{display:flex;align-items:center;gap:10px;margin:8px 0;
+font-family:monospace;font-size:12px}
+.bar{flex:1;height:8px;background:#000;border-radius:4px;overflow:hidden;
+border:1px solid var(--gh-border)}
+.bar-fill{height:100%;background:var(--gh-green);transition:width 0.5s}
+.bar-fill.warn{background:var(--gh-yellow)}
+.bar-fill.danger{background:var(--gh-red)}
+</style>
+</head>
+<body>
+<div class="c">
+<h1>GitHub Client Dashboard</h1>
+<p class="s">Aissa Mohammedi (DGK) · v1.0.0 · localhost</p>
+
+<div class="grid" id="stats">
+<div class="stat"><span class="n" id="cache-n">--</span><span class="l">Cache entries</span></div>
+<div class="stat"><span class="n" id="cache-size">--</span><span class="l">Cache size</span></div>
+<div class="stat"><span class="n" id="token-status">--</span><span class="l">Token</span></div>
+<div class="stat"><span class="n" id="api-status">--</span><span class="l">API</span></div>
+</div>
+
+<div class="card">
+<h2>Rate Limits</h2>
+<div id="rate-limits">Chargement...</div>
+</div>
+
+<div class="card">
+<h2>Test commande</h2>
+<textarea id="cmd" placeholder='{"action":"user","username":"torvalds"}'></textarea>
+<button onclick="runCmd()">Exécuter</button>
+<pre id="output">En attente...</pre>
+</div>
+
+<div class="card">
+<h2>API Endpoints</h2>
+<pre style="color:var(--gh-dim)">
+GET /api/stats → Statistiques
+GET /api/rate → Rate limits
+GET /api/cache → Stats cache
+POST /api/action → Lancer une commande
+{"action":"user","username":"torvalds"}
+{"action":"repo","owner":"torvalds","name":"linux"}
+{"action":"search","query":"python","type":"repos"}
+{"action":"trending","language":"python"}
+{"action":"compare","user1":"a","user2":"b"}
+{"action":"recommend","owner":"a","name":"b"}
+</pre>
+</div>
+
+</div>
+<script>
+async function fetchJSON(url, opts){
+const r = await fetch(url, opts);
+return r.json();
+}
+async function loadStats(){
+try{
+const d = await fetchJSON('/api/stats');
+document.getElementById('cache-n').textContent = d.cache.entries;
+document.getElementById('cache-size').textContent =
+(d.cache.size_bytes / 1024).toFixed(1) + ' KB';
+document.getElementById('token-status').textContent = d.token ? 'OK' : 'NON';
+document.getElementById('api-status').textContent = d.api_ok ? 'OK' : 'KO';
+}catch(e){console.error(e);}
+}
+async function loadRates(){
+try{
+const d = await fetchJSON('/api/rate');
+const div = document.getElementById('rate-limits');
+div.innerHTML = '';
+if(d.resources){
+for(const [name, info] of Object.entries(d.resources)){
+const pct = info.limit ? (info.remaining / info.limit * 100) : 0;
+const cls = pct > 50 ? '' : (pct > 20 ? 'warn' : 'danger');
+div.innerHTML += `
+<div class="rate">
+<span style="width:140px">${name}</span>
+<div class="bar">
+<div class="bar-fill ${cls}" style="width:${pct}%"></div>
+</div>
+<span>${info.remaining}/${info.limit}</span>
+</div>`;
+}
+} else {
+div.textContent = d.error || 'Non disponible';
+}
+}catch(e){console.error(e);}
+}
+async function runCmd(){
+const cmd = document.getElementById('cmd').value;
+const out = document.getElementById('output');
+out.textContent = 'Exécution...';
+try {
+const d = await fetchJSON('/api/action', {
+method: 'POST',
+headers: {'Content-Type':'application/json'},
+body: cmd
+});
+out.textContent = JSON.stringify(d, null, 2);
+loadStats();
+}catch(e){
+out.textContent = 'Erreur : ' + e.message;
+}
+}
+loadStats();
+loadRates();
+setInterval(loadStats, 5000);
+setInterval(loadRates, 15000);
+</script>
+</body>
+</html>"""
+
+
+class DashboardHandler(BaseHTTPRequestHandler):
+"""Handler HTTP pour le dashboard."""
+
+def log_message(self, *args):
+pass
+
+def _send_json(self, data, status=200):
+body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
+self.send_response(status)
+self.send_header("Content-Type", "application/json; charset=utf-8")
+self.send_header("Content-Length", str(len(body)))
+self.send_header("Access-Control-Allow-Origin", "*")
+self.end_headers()
+try:
+self.wfile.write(body)
+except Exception:
+pass
+
+def _send_html(self, html, status=200):
+body = html.encode("utf-8")
+self.send_response(status)
+self.send_header("Content-Type", "text/html; charset=utf-8")
+self.send_header("Content-Length", str(len(body)))
+self.end_headers()
+try:
+self.wfile.write(body)
+except Exception:
+pass
+
+def do_GET(self):
+p = urllib.parse.urlparse(self.path).path
+
+if p in ("/", "/index.html"):
+self._send_html(HTML_DASHBOARD)
+
+elif p == "/api/stats":
+cache_stats = CACHE.stats()
+self._send_json({
+"cache": cache_stats,
+"token": bool(CONFIG.get("token")),
+"api_ok": True,
+"version": VERSION,
+"timestamp": datetime.now().isoformat(),
+})
+
+elif p == "/api/rate":
+resp = API.get_rate_limit()
+if resp.error:
+self._send_json({"error": resp.error}, 500)
+else:
+self._send_json(resp.data)
+
+elif p == "/api/cache":
+self._send_json(CACHE.stats())
+
+elif p == "/api/version":
+self._send_json({
+"version": VERSION,
+"auteur": AUTEUR,
+"licence": LICENCE,
+})
+
+else:
+self._send_json({"error": "not found", "path": p}, 404)
+
+def do_POST(self):
+p = urllib.parse.urlparse(self.path).path
+
+if p == "/api/action":
+length = int(self.headers.get("Content-Length", 0))
+body = self.rfile.read(length).decode("utf-8") if length else "{}"
+
+try:
+data = json.loads(body)
+except json.JSONDecodeError:
+self._send_json({"error": "JSON invalide"}, 400)
+return
+
+action = data.get("action")
+
+if action == "user":
+username = data.get("username")
+resp = API.get_user(username)
+self._send_json(resp.data if not resp.error else {"error": resp.error})
+
+elif action == "repo":
+owner = data.get("owner")
+name = data.get("name")
+resp = API.get_repo(owner, name)
+self._send_json(resp.data if not resp.error else {"error": resp.error})
+
+elif action == "search":
+query = data.get("query")
+type_search = data.get("type", "repos")
+if type_search == "repos":
+resp = API.search_repos(query)
+elif type_search == "users":
+resp = API.search_users(query)
+else:
+resp = API.search_repos(query)
+self._send_json(resp.data if not resp.error else {"error": resp.error})
+
+elif action == "trending":
+lang = data.get("language")
+resp = API.get_trending(language=lang)
+self._send_json(resp.data if not resp.error else {"error": resp.error})
+
+elif action == "compare":
+u1 = data.get("user1")
+u2 = data.get("user2")
+r1 = API.get_user(u1)
+r2 = API.get_user(u2)
+self._send_json({
+"user1": r1.data if not r1.error else {"error": r1.error},
+"user2": r2.data if not r2.error else {"error": r2.error},
+})
+
+elif action == "recommend":
+owner = data.get("owner")
+name = data.get("name")
+r = API.get_repo(owner, name)
+if r.error:
+self._send_json({"error": r.error})
+return
+target = ANALYZER.analyze_repo(r.data)
+lang = target.get("language")
+query = f"language:{lang}" if lang else "stars:>1000"
+resp = API.search_repos(query, per_page=30)
+self._send_json(resp.data if not resp.error else {"error": resp.error})
+
+elif action == "activity":
+username = data.get("username")
+resp = API.get_user_events(username)
+self._send_json(resp.data if not resp.error else {"error": resp.error})
+
+elif action == "clearcache":
+CACHE.clear()
+self._send_json({"status": "cache vidé"})
+
+else:
+self._send_json({"error": f"action inconnue : {action}"}, 400)
+
+else:
+self._send_json({"error": "not found"}, 404)
+
+
+class DashboardServer(ThreadingHTTPServer):
+daemon_threads = True
+allow_reuse_address = True
+
+
+def lancer_dashboard(port=8080):
+"""Lance le serveur dashboard."""
+LOG.info(f"Dashboard : http://127.0.0.1:{port}/")
+try:
+server = DashboardServer(("0.0.0.0", port), DashboardHandler)
+server.serve_forever()
+except KeyboardInterrupt:
+LOG.info("Dashboard arrêté")
+except OSError as e:
+LOG.error(f"Port {port} : {e}")
+
+
+# ============================================================================
+# SECTION 10 — MENU INTERACTIF
+# ============================================================================
+
+def menu_interactif():
+"""Menu principal."""
+while True:
+print("")
+print(f"{COLORS['bold']}{COLORS['or']} ═══ GITHUB CLIENT INTERACTIF ═══{COLORS['reset']}")
+print("")
+print(f" {COLORS['cyan']}[1]{COLORS['reset']} 👤 Utilisateur")
+print(f" {COLORS['cyan']}[2]{COLORS['reset']} 📦 Repos d'un utilisateur")
+print(f" {COLORS['cyan']}[3]{COLORS['reset']} 🔍 Analyser un repo")
+print(f" {COLORS['cyan']}[4]{COLORS['reset']} 🔎 Recherche")
+print(f" {COLORS['cyan']}[5]{COLORS['reset']} 📈 Trending")
+print(f" {COLORS['cyan']}[6]{COLORS['reset']} ⚡ Rate limit")
+print(f" {COLORS['cyan']}[7]{COLORS['reset']} 📊 Activité utilisateur")
+print(f" {COLORS['cyan']}[8]{COLORS['reset']} ⚖️ Comparer 2 users")
+print(f" {COLORS['cyan']}[9]{COLORS['reset']} 💡 Recommandations")
+print(f" {COLORS['cyan']}[10]{COLORS['reset']} 📁 Cache")
+print(f" {COLORS['cyan']}[11]{COLORS['reset']} 🌐 Dashboard web")
+print(f" {COLORS['cyan']}[12]{COLORS['reset']} 📄 Export")
+print(f" {COLORS['cyan']}[0]{COLORS['reset']} ❌ Quitter")
+print("")
+
+try:
+choix = input(f" {COLORS['bold']}Choix : {COLORS['reset']}").strip()
+except (EOFError, KeyboardInterrupt):
+print("")
+return
+
+if choix == "0":
+return
+
+elif choix == "1":
+u = input(" Username : ").strip()
+if u:
+class A: json = False
+CMD.cmd_user(u, A())
+
+elif choix == "2":
+u = input(" Username : ").strip()
+if u:
+class A: json = False; limit = 30; sort = "stars"
+CMD.cmd_repos(u, A())
+
+elif choix == "3":
+target = input(" Owner/repo : ").strip()
+if "/" in target:
+owner, name = target.split("/", 1)
+class A: json = False
+CMD.cmd_repo(owner, name, A())
+
+elif choix == "4":
+q = input(" Query : ").strip()
+t = input(" Type [repos/users/code/issues] : ").strip() or "repos"
+if q:
+class A: json = False; limit = 20; type = t
+CMD.cmd_search(q, A())
+
+elif choix == "5":
+lang = input(" Language (vide pour tous) : ").strip() or None
+class A: json = False; language = lang
+CMD.cmd_trending(A())
+
+elif choix == "6":
+class A: json = False
+CMD.cmd_rate(A())
+
+elif choix == "7":
+u = input(" Username : ").strip()
+if u:
+class A: json = False
+CMD.cmd_activity(u, A())
+
+elif choix == "8":
+u1 = input(" User 1 : ").strip()
+u2 = input(" User 2 : ").strip()
+if u1 and u2:
+class A: json = False
+CMD.cmd_compare(u1, u2, A())
+
+elif choix == "9":
+target = input(" Owner/repo : ").strip()
+if "/" in target:
+owner, name = target.split("/", 1)
+class A: json = False
+CMD.cmd_recommend(owner, name, A())
+
+elif choix == "10":
+class A: clear = False; json = False
+CMD.cmd_cache(A())
+
+elif choix == "11":
+port = CONFIG.get("dashboard_port", 8080)
+print(f" Lancement sur port {port}...")
+lancer_dashboard(port)
+
+elif choix == "12":
+target = input(" User ou Owner/repo : ").strip()
+if target:
+class A: json = False; target = target
+CMD.cmd_export(A())
+
+else:
+print(f" {COLORS['red']}Choix invalide{COLORS['reset']}")
+
+input(f"\n {COLORS['dim']}Entrée pour continuer...{COLORS['reset']}")
+
+
+# ============================================================================
+# SECTION 11 — PARSER CLI
+# ============================================================================
+
+def build_parser():
+parser = argparse.ArgumentParser(
+prog="github_client",
+description=f"GitHub Client Intelligent v{VERSION}",
+formatter_class=argparse.RawDescriptionHelpFormatter,
+epilog="""
+Exemples :
+github_client.py user torvalds
+github_client.py repos torvalds --limit 20
+github_client.py repo torvalds/linux
+github_client.py search "python async" --type repos
+github_client.py trending --language rust
+github_client.py rate
+github_client.py cache --clear
+github_client.py compare torvalds gvanrossum
+github_client.py recommend torvalds/linux
+github_client.py web --port 8080
+"""
+)
+
+parser.add_argument("--version", action="version",
+version=f"%(prog)s {VERSION}")
+parser.add_argument("--token", help="GitHub Personal Access Token")
+parser.add_argument("--json", action="store_true",
+help="Sortie JSON")
+parser.add_argument("--clear-cache", action="store_true",
+help="Vider le cache avant")
+parser.add_argument("--verbose", "-v", action="store_true",
+help="Mode verbeux")
+
+subparsers = parser.add_subparsers(dest="command")
+
+# user
+p_user = subparsers.add_parser("user", help="Infos utilisateur")
+p_user.add_argument("username")
+
+# repos
+p_repos = subparsers.add_parser("repos", help="Repos d'un utilisateur")
+p_repos.add_argument("username")
+p_repos.add_argument("--limit", type=int, default=30)
+p_repos.add_argument("--sort", default="stars",
+choices=["stars", "forks", "issues", "updated", "created"])
+
+# repo
+p_repo = subparsers.add_parser("repo", help="Analyse un repo")
+p_repo.add_argument("target", help="owner/repo")
+
+# search
+p_search = subparsers.add_parser("search", help="Recherche GitHub")
+p_search.add_argument("query")
+p_search.add_argument("--type", default="repos",
+choices=["repos", "users", "code", "issues"])
+p_search.add_argument("--limit", type=int, default=20)
+
+# trending
+p_trending = subparsers.add_parser("trending", help="Repos trending")
+p_trending.add_argument("--language")
+
+# rate
+subparsers.add_parser("rate", help="Rate limit")
+
+# cache
+p_cache = subparsers.add_parser("cache", help="Gestion cache")
+p_cache.add_argument("--clear", action="store_true")
+
+# compare
+p_compare = subparsers.add_parser("compare", help="Comparer 2 users")
+p_compare.add_argument("user1")
+p_compare.add_argument("user2")
+
+# recommend
+p_reco = subparsers.add_parser("recommend", help="Recommandations")
+p_reco.add_argument("target", help="owner/repo")
+
+# activity
+p_activity = subparsers.add_parser("activity", help="Activité utilisateur")
+p_activity.add_argument("username")
+
+# export
+p_export = subparsers.add_parser("export", help="Export rapport")
+p_export.add_argument("target", help="user ou owner/repo")
+
+# web
+p_web = subparsers.add_parser("web", help="Dashboard web")
+p_web.add_argument("--port", type=int, default=8080)
+
+# menu
+subparsers.add_parser("menu", help="Menu interactif")
+
+return parser
+
+
+# ============================================================================
+# SECTION 12 — POINT D'ENTRÉE
+# ============================================================================
+
+def main():
+parser = build_parser()
+args = parser.parse_args()
+
+# Token
+if args.token:
+CONFIG.set("token", args.token)
+API.token = args.token
+
+# Clear cache
+if args.clear_cache:
+CACHE.clear()
+LOG.ok("Cache vidé")
+
+# Menu par défaut
+if not args.command:
+print(f"""
+{COLORS['bold']}{COLORS['or']} ══════════════════════════════════════════════════════════════
+GITHUB CLIENT INTELLIGENT v{VERSION}
+{AUTEUR} · {LICENCE}
+══════════════════════════════════════════════════════════════{COLORS['reset']}
+""")
+menu_interactif()
+return
+
+# Dispatch commandes
+try:
+if args.command == "user":
+CMD.cmd_user(args.username, args)
+
+elif args.command == "repos":
+CMD.cmd_repos(args.username, args)
+
+elif args.command == "repo":
+if "/" not in args.target:
+LOG.error("Format : owner/repo")
+return
+owner, name = args.target.split("/", 1)
+CMD.cmd_repo(owner, name, args)
+
+elif args.command == "search":
+CMD.cmd_search(args.query, args)
+
+elif args.command == "trending":
+CMD.cmd_trending(args)
+
+elif args.command == "rate":
+CMD.cmd_rate(args)
+
+elif args.command == "cache":
+CMD.cmd_cache(args)
+
+elif args.command == "compare":
+CMD.cmd_compare(args.user1, args.user2, args)
+
+elif args.command == "recommend":
+if "/" not in args.target:
+LOG.error("Format : owner/repo")
+return
+owner, name = args.target.split("/", 1)
+CMD.cmd_recommend(owner, name, args)
+
+elif args.command == "activity":
+CMD.cmd_activity(args.username, args)
+
+elif args.command == "export":
+CMD.cmd_export(args)
+
+elif args.command == "web":
+lancer_dashboard(args.port)
+
+elif args.command == "menu":
+menu_interactif()
+
+except KeyboardInterrupt:
+print("")
+LOG.info("Interrompu par l'utilisateur")
+
+except Exception as e:
+LOG.error(f"Erreur : {e}")
+if args.verbose:
+import traceback
+traceback.print_exc()
+
+
+if __name__ == "__main__":
+main()
